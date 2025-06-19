@@ -1,0 +1,19 @@
+#pragma kernel CSMain
+
+#define PI 3.14159
+
+Texture2DArray<float4> Array;
+RWTexture2D<float4> Result;
+float2 ScreenResolution;
+
+SamplerState linearClampSampler;
+
+[numthreads(8,8,1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+    float4 g1 = Array.SampleLevel(linearClampSampler, float3(float2(id.xy) / ScreenResolution, 0), 0);
+    float4 g2 = Array.SampleLevel(linearClampSampler, float3(float2(id.xy) / ScreenResolution, 1), 0);
+    
+    Result[id.xy] += float4((g1.rgb + g2.rgb) * 0.5, 1);
+
+}

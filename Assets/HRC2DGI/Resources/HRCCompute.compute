@@ -1,0 +1,276 @@
+﻿#pragma kernel CSMain
+
+#define PI 3.14159265
+
+int CascadeLevel;
+int CascadeCount;
+float2 Resolution;
+
+float SkyRadiance;
+float3 SkyColor;
+float3 SunColor;
+float SunAngle;
+
+Texture2D<float3> ColorTex;
+Texture2D<float> DistanceTex;
+
+Texture2DArray<float4> UpperCascade;
+RWTexture2DArray<float4> LowerCascade;
+
+SamplerState linearClampSampler;
+
+float3 SampleSkyRadiance(float a0, float a1)
+{
+    const float SSunS = 8.0;
+    const float ISSunS = 1 / SSunS;
+    float3 SI = SkyColor * (a1 - a0 - 0.5 * (cos(a1) - cos(a0)));
+    SI += SunColor * (atan(SSunS * (SunAngle - a0)) - atan(SSunS * (SunAngle - a1))) * ISSunS;
+    return SI * 0.16;
+}
+
+float4 SampleRadianceSDF(float2 rayOrigin, float2 rayDirection, float range)
+{
+    float4 hit = float4(0, 0, 0, 1);
+
+    float t = 0;
+    
+    for (int i = 0; i < 32; i++)
+    {
+        float2 currentPosition = rayOrigin + t * rayDirection;
+
+        if (t > range || currentPosition.x < 0 || currentPosition.y < 0 || currentPosition.x > Resolution.x - 1 || currentPosition.y > Resolution.y - 1)
+        {
+            break;
+        }
+
+        float distance = DistanceTex[currentPosition].r * max(Resolution.x, Resolution.y);
+
+        if (distance < 1)
+        {
+            hit = float4(ColorTex[currentPosition].rgb, 0);
+            break;
+        }
+
+        t += distance;
+    }
+    
+    return hit;
+}
+
+float4 SampleUpperCascade(int2 pos, int2 XMinMax, int2 YMinMax, int z)
+{
+    pos = clamp(pos, 0, Resolution-1);
+    
+    if (pos.x < XMinMax.x || pos.x > XMinMax.y || pos.y < YMinMax.x || pos.y > YMinMax.y)
+        return 0;
+    
+    return UpperCascade[int3(pos, z)];
+}
+
+int remapIndex(int index)
+{
+    return (index + 1) / 2;
+}
+
+int2 getPosition(int index, int level, int reverse)
+{
+    if (level == 0)
+        return int2(1, 0) * reverse;
+    
+    int length = pow(2, level);
+    return int2(length, length - index * 4) * reverse;
+}
+
+float AngleBetweenVectors(float2 a, float2 b)
+{
+    return acos(dot(a, b));
+}
+
+float4 ComputeVerticalPlanes(int2 pixelIndex, int blockCount)
+{
+    int2 blockDim = float2(Resolution.x / blockCount, Resolution.y);
+    int blockIndex = floor(pixelIndex.x / blockDim.x);
+    
+    int2 coordsInBlock = fmod(pixelIndex, blockDim);
+                
+    int2 rayOrigin = int2(coordsInBlock.x * blockCount, coordsInBlock.y);
+    
+    float4 finalResult = 0;
+    
+    float weight[2];
+    
+    if (CascadeLevel == 0)
+    {
+        weight[0] = 0.5;
+        weight[1] = 0.5;
+    }
+    else
+    {
+        float2 ray1 = float2(getPosition(remapIndex((blockIndex * 2) % blockCount), CascadeLevel, 1));
+        float2 ray2 = float2(getPosition(remapIndex((blockIndex * 2 + 1) % blockCount), CascadeLevel, 1));
+        float2 midRay = ray1 + ray2;
+        
+        ray1 = normalize(ray1);
+        ray2 = normalize(ray2);
+        midRay = normalize(midRay);
+        
+        float refAngle = AngleBetweenVectors(ray1, ray2);
+        float angle = AngleBetweenVectors(ray1, midRay);
+        
+        weight[0] = angle / refAngle;
+        weight[1] = 1 - weight[0];
+    }
+    
+    for (int i = 0; i < 2; i++)
+    {
+        int angleIndex = blockIndex * 2 + i;
+        int gIndex = remapIndex(angleIndex % blockCount);
+        int reverse = (angleIndex >= blockCount) ? -1 : 1;
+        
+        float2 rayDir = getPosition(gIndex, CascadeLevel, reverse);
+        
+        int ccc = coordsInBlock.x % 2 == 0 ? 2 : 1;
+        float4 radiance = SampleRadianceSDF(rayOrigin, normalize(rayDir), length(rayDir) * ccc);
+                    
+        if (radiance.a != 0 && CascadeLevel != CascadeCount - 1)
+        {
+            int2 angleOffset = int2(angleIndex * blockDim.x * 0.5, 0);
+            int2 XMinMax = int2(angleOffset.x, angleOffset.x + blockDim.x * 0.5 - 1);
+            int2 YMinMax = int2(0, Resolution.y - 1);
+            
+            float2 positionOffset = float2(float(coordsInBlock.x) * 0.5, coordsInBlock.y);
+                
+            if (coordsInBlock.x % 2 != 0)
+            {
+                int2 offset = rayDir / int2(blockCount, 1);
+            
+                float4 rad = SampleUpperCascade(positionOffset + float2(offset) * float2(0.5, 1) + angleOffset, XMinMax, YMinMax, 0);
+                
+                radiance.rgb += rad.rgb * radiance.a;
+                radiance.a *= rad.a;
+            }
+            else
+            {
+                int2 offset = rayDir / int2(blockCount, 1);
+                offset.y *= 2;
+                        
+                float4 rad1 = SampleUpperCascade(floor(positionOffset) + angleOffset, XMinMax, YMinMax, 0);
+                float4 rad2 = SampleUpperCascade(floor(positionOffset) + angleOffset + offset, XMinMax, YMinMax, 0);
+                  
+                float4 rad = (rad1 + rad2) * 0.5;
+                
+                radiance.rgb += rad.rgb * radiance.a;
+                radiance.a *= rad.a;
+            }
+        }
+        
+        finalResult += radiance * weight[i];
+    }
+    
+    return finalResult;
+}
+
+float4 ComputeHorizontalPlanes(int2 pixelIndex, int blockCount)
+{
+    int2 blockDim = float2(Resolution.x, Resolution.y / blockCount);
+    int blockIndex = floor(pixelIndex.y / blockDim.y);
+    
+    int2 coordsInBlock = fmod(pixelIndex, blockDim);
+                
+    int2 rayOrigin = int2(coordsInBlock.x, coordsInBlock.y * blockCount);
+    
+    float4 finalResult = 0;
+    
+    float weight[2];
+    
+    if (CascadeLevel == 0)
+    {
+        weight[0] = 0.5;
+        weight[1] = 0.5;
+    }
+    else
+    {
+        float2 ray1 = float2(getPosition(remapIndex((blockIndex * 2) % blockCount), CascadeLevel, 1));
+        float2 ray2 = float2(getPosition(remapIndex((blockIndex * 2 + 1) % blockCount), CascadeLevel, 1));
+        float2 midRay = ray1 + ray2;
+        
+        ray1 = normalize(ray1);
+        ray2 = normalize(ray2);
+        midRay = normalize(midRay);
+        
+        float refAngle = AngleBetweenVectors(ray1, ray2);
+        float angle = AngleBetweenVectors(ray1, midRay);
+        
+        weight[0] = angle / refAngle;
+        weight[1] = 1 - weight[0];
+    }
+    
+    for (int i = 0; i < 2; i++)
+    {
+        int angleIndex = blockIndex * 2 + i;
+        int gIndex = remapIndex(angleIndex % blockCount);
+        int reverse = (angleIndex >= blockCount) ? -1 : 1;
+        
+        float2 rayDir = getPosition(gIndex, CascadeLevel, reverse);
+        rayDir = rayDir.yx;
+        
+        int ccc = coordsInBlock.y % 2 == 0 ? 2 : 1;
+        float4 radiance = SampleRadianceSDF(rayOrigin, normalize(rayDir), length(rayDir) * ccc);
+                    
+        if (radiance.a != 0 && CascadeLevel != CascadeCount - 1)
+        {
+            int2 angleOffset = int2(0, angleIndex * blockDim.y * 0.5);
+            int2 YMinMax = int2(angleOffset.y, angleOffset.y + blockDim.y * 0.5 - 1);
+            int2 XMinMax = int2(0, Resolution.x - 1);
+            
+            float2 positionOffset = float2(coordsInBlock.x, float(coordsInBlock.y) * 0.5);
+                
+            if (coordsInBlock.y % 2 != 0)
+            {
+                int2 offset = rayDir / int2(1, blockCount);
+            
+                float4 rad = SampleUpperCascade(positionOffset + float2(offset) * float2(1, 0.5) + angleOffset, XMinMax, YMinMax, 1);
+                
+                radiance.rgb += rad.rgb * radiance.a;
+                radiance.a *= rad.a;
+            }
+            else
+            {
+                int2 offset = rayDir / int2(1, blockCount);
+                offset.x *= 2;
+                        
+                float4 rad1 = SampleUpperCascade(floor(positionOffset) + angleOffset, XMinMax, YMinMax, 1);
+                float4 rad2 = SampleUpperCascade(floor(positionOffset) + angleOffset + offset, XMinMax, YMinMax, 1);
+                  
+                float4 rad = (rad1 + rad2) * 0.5;
+                
+                radiance.rgb += rad.rgb * radiance.a;
+                radiance.a *= rad.a;
+            }
+        }
+        
+        finalResult += radiance * weight[i];
+    }
+    
+    return finalResult;
+}
+
+[numthreads(8,8,1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+    int2 pixelIndex = id.xy;
+    
+    int blockCount = 1 << CascadeLevel;
+    
+    float4 finalResult = 0;
+    if (id.z == 0)
+    {
+        finalResult = ComputeVerticalPlanes(pixelIndex, blockCount);
+    }
+    else
+    {
+        finalResult = ComputeHorizontalPlanes(pixelIndex, blockCount);
+    }
+    
+    LowerCascade[id.xyz] = finalResult;
+}
